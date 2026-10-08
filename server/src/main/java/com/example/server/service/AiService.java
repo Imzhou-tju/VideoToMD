@@ -4,6 +4,7 @@ import com.example.server.dto.AgentFeedback;
 import com.example.server.dto.AgentState;
 import com.example.server.dto.TaskStatus;
 import com.example.server.dto.VideoContext;
+import com.example.server.dto.VideoNoteRenderer;
 import com.example.server.entity.MediaFile;
 import com.example.server.mapper.MediaFileMapper;
 import com.example.server.strategy.AiAnalysisStrategy;
@@ -113,7 +114,8 @@ public class AiService {
         telemetry.bind(traceId);
         try {
             VideoContext followUpContext = new VideoContext(context.source(), question, context.segments());
-            return agentLoopService.run(followUpContext).result().toMarkdown();
+            AgentState state = agentLoopService.run(followUpContext);
+            return VideoNoteRenderer.renderAnalysis(followUpContext, state.result());
         } finally {
             telemetry.clear();
         }
@@ -141,7 +143,7 @@ public class AiService {
             VideoContext revisedContext = new VideoContext(context.source(), goal, context.segments());
             AgentState state = agentLoopService.run(normalized.mediaId(), revisedContext);
             telemetry.stage(traceId, "HUMAN_REVISE", started, true);
-            return state.result().toMarkdown();
+            return VideoNoteRenderer.renderAnalysis(revisedContext, state.result());
         } catch (RuntimeException e) {
             telemetry.stage(traceId, "HUMAN_REVISE", started, false);
             throw e;
@@ -238,7 +240,8 @@ public class AiService {
 
     private void persistResult(MediaFile mediaFile, AgentState agentState) {
         if (agentState.result() == null) throw new IllegalStateException("Agent 未生成分析结果");
-        mediaFile.setAiSummary(agentState.result().toMarkdown());
+        VideoContext context = checkpointService.loadContext(mediaFile.getId());
+        mediaFile.setAiSummary(VideoNoteRenderer.render(context, agentState.result()));
         mediaFileMapper.updateById(mediaFile);
         mediaService.invalidateUserList(mediaFile.getUserId());
     }
