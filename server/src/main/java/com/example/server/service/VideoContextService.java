@@ -4,6 +4,7 @@ import com.example.server.dto.VideoContext;
 import com.example.server.utils.AliyunAsrUtils;
 import com.example.server.utils.MinioUtils;
 import com.example.server.utils.OcrUtils;
+import com.example.server.utils.ProjectionScreenLocator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -13,6 +14,7 @@ import javax.imageio.ImageIO;
 import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -36,6 +38,11 @@ public class VideoContextService {
     private static final long SEGMENT_MS = 60_000L;
     private static final long FALLBACK_FRAME_INTERVAL_MS = 30_000L;
     private static final Pattern PTS_TIME = Pattern.compile("pts_time:([0-9.]+)");
+    /** 从 FFmpeg 输出的视频流信息行里取原始宽高，例如 "Video: h264 ... 1920x1080"。 */
+    private static final Pattern VIDEO_SIZE = Pattern.compile("Video:.*?(\\d{2,5})x(\\d{2,5})");
+    /** 场景变化抽帧的选择条件（不含 showinfo，矫正滤镜要插在它后面）。 */
+    private static final String FRAME_SELECT =
+            "select=eq(n\\,0)+gt(scene\\,0.35)+gte(t-prev_selected_t\\,30)";
 
     private final AliyunAsrUtils aliyunAsrUtils;
     private final OcrUtils ocrUtils;
@@ -152,13 +159,26 @@ public class VideoContextService {
 
     private List<FramePart> extractKeyFrames(String videoPath, Path frameDir, String traceId) throws Exception {
         Files.createDirectories(frameDir);
+        ProjectionScreenLocator.ScreenRegion region = probeScreenRegion(videoPath, frameDir, traceId);
+
+        // 先 select 选出关键帧，再对选出来的帧做透视矫正，比先矫正整段视频省得多
+        String filter = region.needsCorrection()
+                ? FRAME_SELECT + "," + region.perspectiveFilter() + ",showinfo"
+                : FRAME_SELECT + ",showinfo";
         List<Long> timestamps = new ArrayList<>();
-        runCommand(List.of(
-                "ffmpeg", "-y", "-i", videoPath,
-                "-vf", "select=eq(n\\,0)+gt(scene\\,0.35)+gte(t-prev_selected_t\\,30),showinfo",
-                "-vsync", "vfr",
-                frameDir.resolve("frame_%06d.jpg").toString()
-        ), timestamps);
+        try {
+            runCommand(extractFramesCommand(videoPath, frameDir, filter), timestamps, null);
+        } catch (IllegalStateException failure) {
+            if (!region.needsCorrection()) {
+                throw failure;
+            }
+            // perspective 滤镜不可用或参数不合法时退回不矫正的链路，不要让整条 OCR 分支失败
+            telemetry.increment(traceId, "perspectiveFallbacks", 1);
+            log.warn("perspective_filter_fallback video={} filter={}", videoPath, region.perspectiveFilter(), failure);
+            clearDirectory(frameDir);
+            timestamps.clear();
+            runCommand(extractFramesCommand(videoPath, frameDir, FRAME_SELECT + ",showinfo"), timestamps, null);
+        }
 
         List<Path> frameFiles;
         try (var paths = Files.list(frameDir)) {
@@ -201,6 +221,86 @@ public class VideoContextService {
             throw new IllegalStateException("所有 OCR 关键帧均处理失败");
         }
         return result;
+    }
+
+    private List<String> extractFramesCommand(String videoPath, Path frameDir, String filter) {
+        return List.of(
+                "ffmpeg", "-y", "-i", videoPath,
+                "-vf", filter,
+                "-vsync", "vfr",
+                frameDir.resolve("frame_%06d.jpg").toString()
+        );
+    }
+
+    /**
+     * 先抽一组探测帧，让 ProjectionScreenLocator 判断画面里的 PPT 区域在哪里、需不需要矫正。
+     * 任何一步出错都返回 none，走原来的不矫正链路。
+     */
+    private ProjectionScreenLocator.ScreenRegion probeScreenRegion(String videoPath, Path frameDir, String traceId) {
+        Path probeDir = frameDir.resolveSibling(frameDir.getFileName() + "-probe");
+        try {
+            Files.createDirectories(probeDir);
+            List<String> streamLines = new ArrayList<>();
+            runCommand(List.of(
+                    "ffmpeg", "-y", "-i", videoPath,
+                    "-vf", "fps=1/" + (ProjectionScreenLocator.PROBE_INTERVAL_MS / 1000)
+                            + ",scale=" + ProjectionScreenLocator.WORK_WIDTH + ":-2",
+                    "-frames:v", String.valueOf(ProjectionScreenLocator.PROBE_FRAME_COUNT),
+                    probeDir.resolve("probe_%03d.jpg").toString()
+            ), null, streamLines);
+
+            int[] videoSize = parseVideoSize(streamLines);
+            if (videoSize == null) {
+                telemetry.increment(traceId, "screenRegionSizeUnknown", 1);
+                return ProjectionScreenLocator.ScreenRegion.none();
+            }
+
+            List<BufferedImage> probes = new ArrayList<>();
+            try (var paths = Files.list(probeDir)) {
+                for (Path path : paths.filter(Files::isRegularFile).sorted().toList()) {
+                    BufferedImage image = ImageIO.read(path.toFile());
+                    if (image != null) {
+                        probes.add(image);
+                    }
+                }
+            }
+            ProjectionScreenLocator.ScreenRegion region =
+                    ProjectionScreenLocator.locate(probes).scaledTo(videoSize[0], videoSize[1]);
+            telemetry.increment(traceId,
+                    region.needsCorrection() ? "screenRegionCorrections" : "screenRegionSkips", 1);
+            return region;
+        } catch (Exception e) {
+            telemetry.increment(traceId, "screenRegionProbeFailures", 1);
+            log.warn("screen_region_probe_failed video={}", videoPath, e);
+            return ProjectionScreenLocator.ScreenRegion.none();
+        } finally {
+            deleteDirectory(probeDir);
+        }
+    }
+
+    /** FFmpeg 会把输入视频流信息打到日志里，从那一行取原始宽高。 */
+    private static int[] parseVideoSize(List<String> ffmpegLines) {
+        for (String line : ffmpegLines) {
+            Matcher matcher = VIDEO_SIZE.matcher(line);
+            if (matcher.find()) {
+                int width = Integer.parseInt(matcher.group(1));
+                int height = Integer.parseInt(matcher.group(2));
+                if (width > 0 && height > 0) {
+                    return new int[]{width, height};
+                }
+            }
+        }
+        return null;
+    }
+
+    private void clearDirectory(Path directory) {
+        try (var paths = Files.list(directory)) {
+            for (Path path : paths.toList()) {
+                Files.deleteIfExists(path);
+            }
+        } catch (IOException e) {
+            log.warn("frame_directory_clear_failed path={}", directory, e);
+        }
     }
 
     private List<VideoContext.VideoSegment> merge(List<TranscriptPart> transcripts, List<FramePart> frames) {
@@ -246,6 +346,11 @@ public class VideoContextService {
     }
 
     private void runCommand(List<String> command, List<Long> timestamps) throws Exception {
+        runCommand(command, timestamps, null);
+    }
+
+    /** logSink 只收集视频流信息行，避免把 showinfo 的逐帧日志全读进内存。 */
+    private void runCommand(List<String> command, List<Long> timestamps, List<String> logSink) throws Exception {
         Path logPath = Files.createTempFile("video-ffmpeg-", ".log");
         Process process = null;
         try {
@@ -258,9 +363,16 @@ public class VideoContextService {
                 throw new IllegalStateException("FFmpeg 执行超时");
             }
             if (process.exitValue() != 0) throw new IllegalStateException("FFmpeg 执行失败");
-            if (timestamps != null) {
+            if (timestamps != null || logSink != null) {
                 try (Stream<String> lines = Files.lines(logPath)) {
-                    lines.forEach(line -> appendTimestamp(line, timestamps));
+                    lines.forEach(line -> {
+                        if (timestamps != null) {
+                            appendTimestamp(line, timestamps);
+                        }
+                        if (logSink != null && line.contains("Video:")) {
+                            logSink.add(line);
+                        }
+                    });
                 }
             }
         } catch (InterruptedException e) {
