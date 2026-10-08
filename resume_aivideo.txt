@@ -1,0 +1,11 @@
+智能视频内容理解平台 | 后端开发
+2026.04 - 2026.09（日期按实际调整）
+
+项目概述：基于 Spring Boot 3、RocketMQ、Redis、MySQL、MinIO、FFmpeg、LangChain4j 构建面向长视频内容理解的 Video Agent 平台，集成分片上传、异步解析、多模态上下文构建与受控 Agent 工作流，将“看视频”转化为“查视频”。
+
+• 针对 GB 级视频大文件，采用前端分片上传 + Redis 维护分片状态实现断点续传，网络中断后仅补传缺失分片，避免整文件重传造成的带宽浪费与超时失败。
+• 基于 RocketMQ 将视频解析从 HTTP 请求线程剥离为异步消费，合并完成即返回任务 ID；结合视频 MD5 内容指纹与 Redisson 分布式锁控制同文件并发解析，并按任务与目标记录完成状态实现消费幂等，消息重复投递直接复用已有结果。
+• 在网关层以 Redis 令牌桶控制 AI 请求速率，第三方 ASR 与大模型异常时采用指数退避有限重试；解析任务任意阶段失败可通过 Redis 四阶段 Checkpoint 复用最近成功状态，长视频无需从头重算。
+• 利用 FFmpeg 抽取音频与场景关键帧，ASR 语音转写与关键帧 OCR 并行执行后按时间轴融合为统一 VideoSegment，构建多模态 VideoContext 供 Agent 检索、引用与校验。
+• 针对长视频按每 5 分钟切块生成摘要、关键词与 Embedding，Agent 默认仅检索压缩摘要，经关键词匹配与 Embedding 余弦相似度混合排序加载 TopK 原始证据，避免长文本全量灌入大模型带来的上下文干扰与 token 浪费。
+• 采用 Planner-Executor-Critic 受控 AgentLoop：Planner 将用户目标拆为 3-5 个子任务，Executor 检索视频证据生成带时间戳的结构化结论，Critic 校验目标覆盖与证据一致性，未通过最多两轮定向重生成；首次解析后持久化 VideoContext，用户追问复用已有上下文免重跑上传与预处理，Checkpoint 按视频 ID 与目标隔离支持同视频多视角分析。
